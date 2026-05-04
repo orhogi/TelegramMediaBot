@@ -1,4 +1,4 @@
 telethon>=1.36,<2
 python-dotenv>=1.0,<2
 psutil>=5.9,<7
-cryptg>=1.0
+cryptg==0.5.2

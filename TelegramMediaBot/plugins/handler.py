@@ -600,6 +600,8 @@ class TelegramBot:
             return
 
         task = asyncio.create_task(self._post_download_task(chat_id, entity, msg_id, thread_id))
+        async with self.task_lock:
+            self.running_tasks.add(task)
 
     async def _post_download_task(self, chat_id, entity, msg_id, thread_id=None):
         try:

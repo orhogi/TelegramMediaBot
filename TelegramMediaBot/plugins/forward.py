@@ -7,7 +7,16 @@ class AutoForward:
     def __init__(self, bot_client, forward_chat_id):
         self.bot = bot_client
         self.forward_chat = None
-        self.chat_id = forward_chat_id
+        self.chat_id = self._coerce(forward_chat_id)
+
+    @staticmethod
+    def _coerce(value):
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
 
     async def setup(self):
         if not self.chat_id:
@@ -24,18 +33,13 @@ class AutoForward:
             return
         try:
             await self.bot.forward_messages(
-                self.chat_id, source_chat_id, source_message_id
+                self.forward_chat, source_message_id, source_chat_id
             )
         except Exception as e:
             logger.warning(f"Auto-forward failed: {e}")
 
-    async def send_copy(self, chat_id, message_id):
-        if not self.forward_chat:
-            return
-        try:
-            await self.bot.copy_message(self.chat_id, chat_id, message_id)
-        except Exception as e:
-            logger.warning(f"Auto-forward copy failed: {e}")
+    async def send_copy(self, source_chat_id, source_message_id):
+        await self.forward_media(source_chat_id, source_message_id)
 
     @property
     def enabled(self):

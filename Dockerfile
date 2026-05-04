@@ -1,8 +1,10 @@
-FROM python:3.12-alpine
+FROM python:3.12-slim
 
-RUN apk add --no-cache ffmpeg
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg procps \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN adduser -D -h /app appuser
+RUN useradd --create-home --home-dir /app appuser
 
 WORKDIR /app
 
@@ -12,11 +14,8 @@ ENV TZ=Asia/Kolkata \
 
 COPY requirements.txt .
 
-RUN apk add --no-cache --virtual .build-deps build-base \
-    && pip install --no-cache-dir -U pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt \
-    && apk --purge del .build-deps \
-    && rm -rf /var/cache/apk/*
+RUN pip install --no-cache-dir -U pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
