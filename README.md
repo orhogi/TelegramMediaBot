@@ -37,7 +37,7 @@ A unified Telegram bot that downloads stories and media from any Telegram post �
 - **Batch Download** — Download a range of posts with `/bdl`
 - **In-Chat Session Generator** — Generate a user session with `/login` — no external tools needed
 - **Progress Bars** — Real-time download/upload progress: percentage, speed, ETA, visual bar
-- **Auto-Forward** — Optionally forward all downloads to a target channel
+- **Auto-Forward** — Optionally forward all downloads to a target channel (bot must be admin)
 - **System Stats** — CPU, RAM, disk, and network monitoring via `/stats`
 - **Dual-Client** — Bot handles interaction, user session accesses restricted content
 
@@ -97,7 +97,7 @@ FLOOD_WAIT_DELAY=10
 | `TOKEN` | Yes | Bot token from [@BotFather](https://t.me/BotFather) |
 | `DEVS` | Yes | Comma-separated developer user IDs — can use `/status`, `/stats` |
 | `STRING_SESSION` | Auto | User session string — leave empty, use `/login` to auto-fill |
-| `FORWARD_CHAT_ID` | Optional | Channel ID or `@username` to auto-forward all downloads |
+| `FORWARD_CHAT_ID` | Optional | Channel ID or `@username` to auto-forward all downloads. Bot must be an admin in the target chat with post permissions. |
 | `MAX_CONCURRENT_DOWNLOADS` | No (1) | Maximum simultaneous downloads |
 | `FLOOD_WAIT_DELAY` | No (10) | Seconds between batch chunks to avoid rate limits |
 
@@ -406,6 +406,12 @@ docker run -d \
 | "Both URLs must be from the same chat" | The start and end URLs must point to the same channel/group. |
 | Batch hangs or is very slow | `FLOOD_WAIT_DELAY` pauses every 10 posts. Lower it in `.env` — but too low risks rate limits. |
 | Some posts skipped | The post has no media or text, OR it's part of a media group already processed. |
+
+### Forwarding
+
+| Symptom | Fix |
+|---|---|
+| Auto-forward not working | The bot must be an **admin** in the destination channel/group with permission to post messages. Add the bot as admin and try again. |
 
 ---
 
