@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    container_name: telegram-media-bot
+    restart: unless-stopped
+    volumes:
+      - ./sessions:/app/sessions
+      - ./.env:/app/.env:ro
+      - ./downloads:/app/downloads
+    environment:
+      - TZ=Asia/Kolkata
