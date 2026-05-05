@@ -1,18 +1,24 @@
 import asyncio
+import html
+import json
 import logging
 import os
+from collections import OrderedDict
 from datetime import datetime
 
 from telethon import Button, TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.functions.stories import GetPeerStoriesRequest
-from telethon.tl.types import DocumentAttributeVideo
+from telethon.tl.functions.stories import (
+    GetPeerStoriesRequest,
+    GetStoriesByIDRequest,
+)
+from telethon.tl.types import DocumentAttributeVideo, StoryItem
+from telethon.errors import FloodWaitError
 
 from .config import config
 from .forward import AutoForward
 from .progress import Progress
 from .utils import (
-    check_file_size_limit,
     clean_all_downloads,
     cleanup_download,
     format_bytes,
@@ -22,10 +28,22 @@ from .utils import (
     get_media_dimensions,
     get_media_duration,
     get_media_info,
+    get_thumb_path,
     generate_video_thumbnail,
+    is_within_upload_limit,
+    parse_story_url,
     parse_tg_url,
+    prepare_caption,
     size_of_downloads,
 )
+
+MAX_PROCESSED_GROUPS = 1000
+SESSION_REVEAL_TTL_SECONDS = 300
+DOWNLOADED_STORIES_FILE = "sessions/downloaded_stories.json"
+
+
+def _story_state_key(username):
+    return username.lstrip("@").lower()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -50,10 +68,13 @@ class TelegramBot:
         self.stats_lock = asyncio.Lock()
         self.semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
         self.running_tasks = set()
-        self.processed_media_groups = set()
+        self.processed_media_groups = OrderedDict()
         self.user_ok = False
         self.login_sessions = {}
         self._last_summary_update = 0
+        self.cleanup_in_progress = False
+        self.story_state_lock = asyncio.Lock()
+        self.downloaded_stories = self._load_downloaded_stories()
 
     @property
     def _getter(self):
@@ -127,6 +148,11 @@ class TelegramBot:
             await self._handle_command(event)
             return
 
+        story_user, story_id = parse_story_url(message_text)
+        if story_user and story_id:
+            await self.download_archived_story(chat_id, story_user, story_id)
+            return
+
         parsed = parse_tg_url(message_text)
         entity, msg_id, _ = parsed
 
@@ -181,17 +207,27 @@ class TelegramBot:
             await self._handle_help(event)
 
         elif cmd == "/status":
-            if sender_id in config.DEVS:
-                await self._show_status(event)
+            if sender_id not in config.DEVS:
+                await event.reply("<b>Permission denied.</b>", parse_mode="html")
+                return
+            await self._show_status(event)
 
         elif cmd == "/stats":
-            if sender_id in config.DEVS:
-                await self._show_stats(event)
+            if sender_id not in config.DEVS:
+                await event.reply("<b>Permission denied.</b>", parse_mode="html")
+                return
+            await self._show_stats(event)
 
         elif cmd == "/killall":
+            if sender_id not in config.DEVS:
+                await event.reply("<b>Permission denied.</b>", parse_mode="html")
+                return
             await self._handle_killall(event)
 
         elif cmd == "/cleanup":
+            if sender_id not in config.DEVS:
+                await event.reply("<b>Permission denied.</b>", parse_mode="html")
+                return
             await self._handle_cleanup(event)
 
         elif cmd == "/login":
@@ -215,18 +251,43 @@ class TelegramBot:
                     parse_mode="html",
                 )
 
+        elif cmd == "/sdl":
+            if len(parts) >= 2:
+                suser, sid = parse_story_url(parts[1])
+                if suser and sid:
+                    await self.download_archived_story(chat_id, suser, sid)
+                else:
+                    await event.reply("<b>Invalid story URL.</b>", parse_mode="html")
+            else:
+                await event.reply(
+                    "<b>Usage:</b> <code>/sdl &lt;story_url&gt;</code>",
+                    parse_mode="html",
+                )
+
+        else:
+            await event.reply(
+                f"<b>Unknown command:</b> <code>{html.escape(cmd)}</code>\n"
+                "Use <code>/help</code> for the command list.",
+                parse_mode="html",
+            )
+
     async def _handle_help(self, event):
         await event.reply(
             "<b>Commands</b>\n\n"
-            "<code>@username</code> \u2014 Download stories from a user\n"
+            "<code>@username</code> \u2014 Download new stories only (skips already downloaded)\n"
             "<code>t.me/username</code> \u2014 Same as above\n"
+            "<code>t.me/username/s/ID</code> \u2014 Download a single archived story\n"
             "<code>t.me/channel/msg_id</code> \u2014 Download media from a post\n"
             "<code>/dl &lt;url&gt;</code> \u2014 Force post download\n"
             "<code>/bdl &lt;url1&gt; &lt;url2&gt;</code> \u2014 Batch download post range\n"
+            "<code>/sdl &lt;story_url&gt;</code> \u2014 Download a single archived story\n"
+            "<code>/login</code> \u2014 Generate a user session string\n"
+            "<code>/cancel</code> \u2014 Cancel an in-progress login\n"
             "<code>/start</code> \u2014 Welcome message\n"
-            "<code>/help</code> \u2014 This help\n"
-            "<code>/status</code> \u2014 Bot statistics (devs only)\n"
-            "<code>/stats</code> \u2014 System resources (devs only)\n"
+            "<code>/help</code> \u2014 This help\n\n"
+            "<b>Devs only</b>\n"
+            "<code>/status</code> \u2014 Bot statistics\n"
+            "<code>/stats</code> \u2014 System resources\n"
             "<code>/killall</code> \u2014 Cancel all running tasks\n"
             "<code>/cleanup</code> \u2014 Delete all temp download files",
             parse_mode="html",
@@ -245,7 +306,12 @@ class TelegramBot:
             self.user_tasks.clear()
         if tasks_to_await:
             await asyncio.gather(*tasks_to_await, return_exceptions=True)
-        await event.reply(f"<b>Cancelled {cancelled} running task(s).</b>", parse_mode="html")
+        if cancelled == 0:
+            await event.reply("<b>No running tasks.</b>", parse_mode="html")
+        else:
+            await event.reply(
+                f"<b>Cancelled {cancelled} running task(s).</b>", parse_mode="html"
+            )
 
     async def _handle_cleanup(self, event):
         async with self.task_lock:
@@ -255,7 +321,17 @@ class TelegramBot:
                     parse_mode="html",
                 )
                 return
-        removed, freed = clean_all_downloads()
+            if self.cleanup_in_progress:
+                await event.reply("<b>Cleanup already in progress.</b>", parse_mode="html")
+                return
+            self.cleanup_in_progress = True
+
+        try:
+            removed, freed = await asyncio.to_thread(clean_all_downloads)
+        finally:
+            async with self.task_lock:
+                self.cleanup_in_progress = False
+
         await event.reply(
             f"<b>Cleanup complete</b>\n"
             f"Files removed: <code>{removed}</code>\n"
@@ -432,20 +508,71 @@ class TelegramBot:
             )
 
     async def _finish_login(self, chat_id, user_id, session):
-        session_string = session["client"].session.save()
-        await session["client"].disconnect()
-        del self.login_sessions[user_id]
+        try:
+            session_string = session["client"].session.save()
+        finally:
+            try:
+                await session["client"].disconnect()
+            except Exception:
+                pass
+            self.login_sessions.pop(user_id, None)
 
-        await self.client.send_message(
+        sent = await self.client.send_message(
             chat_id,
             "<b>\u26a0 Session generated</b>\n\n"
             f"<code>{session_string}</code>\n\n"
             "<b>Keep this secret!</b> Anyone with this string can access your Telegram account.\n"
             "Copy it to <code>STRING_SESSION</code> in your <code>.env</code> file "
             "and restart the bot.\n\n"
-            "Delete this message after copying for safety.",
+            f"<i>This message will self-destruct in {SESSION_REVEAL_TTL_SECONDS // 60} minutes.</i>",
             parse_mode="html",
         )
+        asyncio.create_task(self._delete_after(sent, SESSION_REVEAL_TTL_SECONDS))
+
+    @staticmethod
+    async def _delete_after(message, delay):
+        try:
+            await asyncio.sleep(delay)
+            await message.delete()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Story dedupe state
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_downloaded_stories():
+        if not os.path.exists(DOWNLOADED_STORIES_FILE):
+            return {}
+        try:
+            with open(DOWNLOADED_STORIES_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            return {k: set(v) for k, v in data.items()}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to load story state: {e}")
+            return {}
+
+    @staticmethod
+    def _write_stories_file_sync(data):
+        os.makedirs(os.path.dirname(DOWNLOADED_STORIES_FILE), exist_ok=True)
+        tmp = DOWNLOADED_STORIES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, DOWNLOADED_STORIES_FILE)
+
+    async def _is_story_downloaded(self, key, story_id):
+        async with self.story_state_lock:
+            return story_id in self.downloaded_stories.get(key, set())
+
+    async def _mark_story_downloaded(self, key, story_id):
+        async with self.story_state_lock:
+            self.downloaded_stories.setdefault(key, set()).add(story_id)
+            data = {k: sorted(list(v)) for k, v in self.downloaded_stories.items()}
+        try:
+            await asyncio.to_thread(self._write_stories_file_sync, data)
+        except OSError as e:
+            logger.error(f"Failed to persist story state: {e}")
 
     async def _cancel_login(self, user_id, chat_id):
         session = self.login_sessions.pop(user_id, None)
@@ -481,6 +608,12 @@ class TelegramBot:
                 parse_mode="html",
             )
             async with self.task_lock:
+                if self.cleanup_in_progress:
+                    await msg.edit(
+                        "<b>Cleanup in progress, please retry shortly.</b>",
+                        parse_mode="html",
+                    )
+                    return
                 if chat_id not in self.user_tasks:
                     self.user_tasks[chat_id] = []
                 task = asyncio.create_task(self._story_task(chat_id, username, msg.id))
@@ -493,6 +626,7 @@ class TelegramBot:
     async def _story_task(self, chat_id, username, status_msg_id):
         try:
             async with self.semaphore:
+                key = _story_state_key(username)
                 stories = await self.user_client(GetPeerStoriesRequest(username))
                 peer_stories = getattr(stories, "stories", None)
                 if not peer_stories:
@@ -512,19 +646,38 @@ class TelegramBot:
                     )
                     return
 
+                new_stories = []
+                already_count = 0
+                for s in story_list:
+                    if not await self._is_story_downloaded(key, s.id):
+                        new_stories.append(s)
+                    else:
+                        already_count += 1
+
+                if not new_stories:
+                    await self.client.edit_message(
+                        chat_id, status_msg_id,
+                        f"<b>No new stories from @{username}</b> "
+                        f"(all {already_count} already downloaded)",
+                        parse_mode="html",
+                    )
+                    return
+
                 await self.client.delete_messages(chat_id, status_msg_id)
 
-                total = len(story_list)
-                for i, story in enumerate(story_list):
+                total = len(new_stories)
+                for i, story in enumerate(new_stories):
                     idx = i + 1
                     progress_msg = await self.client.send_message(
                         chat_id,
                         f"<b>Story {idx}/{total} from</b> <code>{username}</code>",
                         parse_mode="html",
                     )
-                    await self._download_single_story(
+                    success = await self._download_single_story(
                         chat_id, username, story, progress_msg.id, idx, total
                     )
+                    if success:
+                        await self._mark_story_downloaded(key, story.id)
                     await self.client.edit_message(
                         chat_id, progress_msg.id,
                         f"<b>Story {idx}/{total}</b> \u2713 Complete",
@@ -533,7 +686,7 @@ class TelegramBot:
 
                 await self.client.send_message(
                     chat_id,
-                    f"All {total} stories from <code>{username}</code> uploaded.",
+                    f"All {total} new stories from <code>{username}</code> uploaded.",
                     parse_mode="html",
                 )
         except Exception as e:
@@ -548,33 +701,34 @@ class TelegramBot:
                         del self.user_tasks[chat_id]
 
     async def _download_single_story(self, chat_id, username, story, progress_msg_id, idx, total):
-        task = {}
+        story_file = None
+        story_thumb = None
+        sent = None
         try:
             progress = Progress(self.client, chat_id, progress_msg_id,
                                 f"Downloading story {idx}/{total}")
             story_file = await self.user_client.download_media(
                 story.media, progress_callback=progress
             )
-            story_thumb = await self.user_client.download_media(story.media, thumb=-1)
-            task = {
-                "username": username,
-                "file": story_file,
-                "thumb": story_thumb,
-                "caption": story.caption,
-                "attributes": (
-                    story.media.document.attributes
-                    if hasattr(story.media, "document")
-                    else None
-                ),
-            }
+            try:
+                story_thumb = await self.user_client.download_media(story.media, thumb=-1)
+            except Exception as e:
+                logger.warning(f"Failed to download story thumb for {username}: {e}")
+                story_thumb = None
+
+            attributes = (
+                story.media.document.attributes
+                if hasattr(story.media, "document")
+                else None
+            )
             upload_progress = Progress(self.client, chat_id, progress_msg_id,
                                        f"Uploading story {idx}/{total}")
             sent = await self.client.send_file(
                 chat_id,
-                task["file"],
-                attributes=task["attributes"],
-                thumb=task["thumb"],
-                caption=task["caption"],
+                story_file,
+                attributes=attributes,
+                thumb=story_thumb,
+                caption=story.caption,
                 progress_callback=upload_progress,
             )
             async with self.stats_lock:
@@ -584,10 +738,130 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Error downloading story from {username}: {e}")
         finally:
-            if task.get("file") and os.path.exists(task["file"]):
-                os.remove(task["file"])
-            if task.get("thumb") and os.path.exists(task["thumb"]):
-                os.remove(task["thumb"])
+            if story_file and os.path.exists(story_file):
+                try:
+                    os.remove(story_file)
+                except OSError:
+                    pass
+            if story_thumb and os.path.exists(story_thumb):
+                try:
+                    os.remove(story_thumb)
+                except OSError:
+                    pass
+        return sent is not None
+
+    # ------------------------------------------------------------------
+    # Archived Story Download
+    # ------------------------------------------------------------------
+
+    async def download_archived_story(self, chat_id, username, story_id):
+        if not self.user_ok:
+            logger.info(f"Archived story download rejected for {username}/{story_id} — no user session")
+            await self.client.send_message(
+                chat_id,
+                "<b>Story downloads require a valid user session.</b>\n"
+                "Use <code>/login</code> to generate one.",
+                parse_mode="html",
+            )
+            return
+        try:
+            msg = await self.client.send_message(
+                chat_id,
+                f"<b>Fetching archived story</b> <code>{username}/s/{story_id}</code>...",
+                parse_mode="html",
+            )
+            async with self.task_lock:
+                if self.cleanup_in_progress:
+                    await msg.edit(
+                        "<b>Cleanup in progress, please retry shortly.</b>",
+                        parse_mode="html",
+                    )
+                    return
+                if chat_id not in self.user_tasks:
+                    self.user_tasks[chat_id] = []
+                task = asyncio.create_task(
+                    self._archived_story_task(chat_id, username, story_id, msg.id)
+                )
+                self.user_tasks[chat_id].append(task)
+                self.running_tasks.add(task)
+        except Exception as e:
+            logger.error(f"Error starting archived story download for {username}/{story_id}: {e}")
+            await self.client.send_message(
+                chat_id, f"Failed to start download for {username}/s/{story_id}"
+            )
+
+    async def _archived_story_task(self, chat_id, username, story_id, status_msg_id):
+        try:
+            async with self.semaphore:
+                key = _story_state_key(username)
+
+                if await self._is_story_downloaded(key, story_id):
+                    await self.client.edit_message(
+                        chat_id, status_msg_id,
+                        f"<b>Story</b> <code>{username}/s/{story_id}</code> \u2014 already downloaded",
+                        parse_mode="html",
+                    )
+                    return
+
+                try:
+                    result = await self.user_client(
+                        GetStoriesByIDRequest(peer=username, id=[story_id])
+                    )
+                except FloodWaitError as fw:
+                    wait = fw.seconds + 1
+                    await self.client.edit_message(
+                        chat_id, status_msg_id,
+                        f"<b>Flood wait</b> \u2014 Telegram requires a {fw.seconds}s pause.\n"
+                        f"Waiting <code>{wait}s</code> before retrying...",
+                        parse_mode="html",
+                    )
+                    logger.warning(f"Flood wait {fw.seconds}s on archived story {username}/s/{story_id}")
+                    await asyncio.sleep(wait)
+                    result = await self.user_client(
+                        GetStoriesByIDRequest(peer=username, id=[story_id])
+                    )
+                stories_list = getattr(result, "stories", [])
+                story = next((s for s in stories_list if isinstance(s, StoryItem)), None)
+
+                if not story:
+                    await self.client.edit_message(
+                        chat_id, status_msg_id,
+                        f"<b>Story</b> <code>{username}/s/{story_id}</code> not found or inaccessible.",
+                        parse_mode="html",
+                    )
+                    return
+
+                await self.client.edit_message(
+                    chat_id, status_msg_id,
+                    f"<b>Story</b> <code>{username}/s/{story_id}</code> \u2014 downloading...",
+                    parse_mode="html",
+                )
+
+                success = await self._download_single_story(
+                    chat_id, username, story, status_msg_id, 1, 1
+                )
+                if success:
+                    await self._mark_story_downloaded(key, story_id)
+
+                await self.client.edit_message(
+                    chat_id, status_msg_id,
+                    f"<b>Story</b> <code>{username}/s/{story_id}</code> \u2713 Complete",
+                    parse_mode="html",
+                )
+        except Exception as e:
+            logger.error(f"Archived story task error for {username}/s/{story_id}: {e}")
+            await self.client.send_message(
+                chat_id, f"Failed to download archived story {username}/s/{story_id}"
+            )
+        finally:
+            async with self.task_lock:
+                self.running_tasks.discard(asyncio.current_task())
+                if chat_id in self.user_tasks:
+                    self.user_tasks[chat_id] = [
+                        t for t in self.user_tasks[chat_id] if not t.done()
+                    ]
+                    if not self.user_tasks[chat_id]:
+                        del self.user_tasks[chat_id]
 
     # ------------------------------------------------------------------
     # Post Download
@@ -599,9 +873,27 @@ class TelegramBot:
             await self.client.send_message(chat_id, "Invalid post link.")
             return
 
-        task = asyncio.create_task(self._post_download_task(chat_id, entity, msg_id, thread_id))
         async with self.task_lock:
+            if self.cleanup_in_progress:
+                await self.client.send_message(
+                    chat_id, "<b>Cleanup in progress, please retry shortly.</b>",
+                    parse_mode="html",
+                )
+                return
+            task = asyncio.create_task(
+                self._post_download_task(chat_id, entity, msg_id, thread_id)
+            )
             self.running_tasks.add(task)
+
+    async def _claim_media_group(self, group_key):
+        async with self.task_lock:
+            if group_key in self.processed_media_groups:
+                self.processed_media_groups.move_to_end(group_key)
+                return False
+            self.processed_media_groups[group_key] = True
+            while len(self.processed_media_groups) > MAX_PROCESSED_GROUPS:
+                self.processed_media_groups.popitem(last=False)
+            return True
 
     async def _post_download_task(self, chat_id, entity, msg_id, thread_id=None):
         try:
@@ -637,14 +929,25 @@ class TelegramBot:
                     )
                     return
 
-                await self._process_post_message(chat_id, message, status_msg, entity)
+                success = await self._process_post_message(
+                    chat_id, message, status_msg, entity
+                )
 
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+                if success:
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Post download task error: {e}")
+            try:
+                await self.client.send_message(
+                    chat_id, f"<b>Error:</b> {html.escape(str(e))}", parse_mode="html"
+                )
+            except Exception:
+                pass
         finally:
             async with self.task_lock:
                 self.running_tasks.discard(asyncio.current_task())
@@ -652,27 +955,39 @@ class TelegramBot:
     async def _process_post_message(self, chat_id, message, status_msg, entity):
         if message.poll:
             await status_msg.edit("<b>Polls cannot be downloaded.</b>", parse_mode="html")
-            return
+            return False
 
         if message.grouped_id:
             group_key = (entity, message.grouped_id)
-            if group_key not in self.processed_media_groups:
-                self.processed_media_groups.add(group_key)
-                group_messages = await self._get_media_group(entity, message.id, message.grouped_id)
+            if await self._claim_media_group(group_key):
+                group_messages = await self._get_media_group(
+                    entity, message.id, message.grouped_id
+                )
                 if len(group_messages) > 1:
-                    await self._process_media_group(chat_id, group_messages, status_msg)
-                    return
+                    return await self._process_media_group(
+                        chat_id, group_messages, status_msg
+                    )
 
         if message.media:
-            await self._download_and_send_media(chat_id, message, status_msg, entity)
+            return await self._download_and_send_media(
+                chat_id, message, status_msg, entity
+            )
         elif message.text:
-            sent_msg = await self.client.send_message(chat_id, message.text)
+            sent_msg = await self.client.send_message(
+                chat_id,
+                message.message or "",
+                formatting_entities=list(message.entities) if message.entities else None,
+            )
             await self.forwarder.send_copy(chat_id, sent_msg.id)
             async with self.stats_lock:
                 self.downloaded_count += 1
             await status_msg.edit("<b>Text sent.</b>", parse_mode="html")
+            return True
         else:
-            await status_msg.edit("<b>No downloadable content in this post.</b>", parse_mode="html")
+            await status_msg.edit(
+                "<b>No downloadable content in this post.</b>", parse_mode="html"
+            )
+            return False
 
     async def _get_media_group(self, entity, msg_id, grouped_id):
         try:
@@ -692,97 +1007,220 @@ class TelegramBot:
         downloaded = []
         try:
             for msg in messages:
-                if msg.media:
-                    progress = Progress(self.client, chat_id, status_msg.id, "Downloading")
-                    path = get_download_path(msg.id, get_file_name(msg))
-                    dl_path = await self._getter.download_media(
-                        msg, file=path, progress_callback=progress
+                if not msg.media:
+                    continue
+                if msg.file and not is_within_upload_limit(msg.file.size):
+                    await status_msg.edit(
+                        f"<b>Skipping {msg.id}: exceeds upload limit.</b>",
+                        parse_mode="html",
                     )
-                    if dl_path:
-                        downloaded.append((msg, dl_path))
+                    continue
+                progress = Progress(self.client, chat_id, status_msg.id, "Downloading")
+                path = get_download_path(chat_id, msg.id, get_file_name(msg))
+                dl_path = await self._getter.download_media(
+                    msg, file=path, progress_callback=progress
+                )
+                if dl_path:
+                    downloaded.append((msg, dl_path))
 
             if not downloaded:
-                await status_msg.edit("<b>Failed to download media group.</b>", parse_mode="html")
-                return
+                await status_msg.edit(
+                    "<b>Failed to download media group.</b>", parse_mode="html"
+                )
+                return False
 
-            album_files = [path for _, path in downloaded]
-            caption = downloaded[0][0].text if downloaded[0][0].text else None
-            sent = await self.client.send_file(chat_id, album_files, caption=caption)
-            async with self.stats_lock:
-                self.downloaded_count += 1
-            if sent:
-                if isinstance(sent, list):
-                    for s in sent:
-                        await self.forwarder.forward_media(chat_id, s.id)
-                else:
-                    await self.forwarder.forward_media(chat_id, sent.id)
+            has_video = any(
+                m.video or (
+                    m.document and getattr(m.document, "mime_type", "").startswith("video/")
+                )
+                for m, _ in downloaded
+            )
+
+            if not has_video:
+                album_files = [path for _, path in downloaded]
+                caption, entities = prepare_caption(downloaded[0][0])
+                sent = await self.client.send_file(
+                    chat_id,
+                    album_files,
+                    caption=caption,
+                    formatting_entities=entities,
+                )
+                async with self.stats_lock:
+                    self.downloaded_count += 1
+                if sent:
+                    if isinstance(sent, list):
+                        for s in sent:
+                            await self.forwarder.forward_media(chat_id, s.id)
+                    else:
+                        await self.forwarder.forward_media(chat_id, sent.id)
+            else:
+                total = len(downloaded)
+                for i, (msg, dl_path) in enumerate(downloaded):
+                    upload_progress = Progress(
+                        self.client, chat_id, status_msg.id,
+                        f"Uploading {i+1}/{total}",
+                    )
+                    if msg.video:
+                        await self._send_video(
+                            chat_id, msg, dl_path, status_msg, upload_progress
+                        )
+                    elif msg.audio:
+                        await self._send_audio(
+                            chat_id, msg, dl_path, status_msg, upload_progress
+                        )
+                    elif msg.photo:
+                        await self._send_generic(
+                            chat_id, msg, dl_path, status_msg, upload_progress
+                        )
+                    elif msg.document:
+                        mime = getattr(msg.document, "mime_type", "") or ""
+                        if mime.startswith("video/"):
+                            await self._send_video(
+                                chat_id, msg, dl_path, status_msg, upload_progress
+                            )
+                        elif mime.startswith("audio/"):
+                            await self._send_audio(
+                                chat_id, msg, dl_path, status_msg, upload_progress
+                            )
+                        else:
+                            info = get_media_info(dl_path)
+                            if info:
+                                dur = get_media_duration(info)
+                                w, h = get_media_dimensions(info, dl_path)
+                                if dur and w and h:
+                                    await self._send_video(
+                                        chat_id, msg, dl_path, status_msg, upload_progress
+                                    )
+                                elif dur:
+                                    await self._send_audio(
+                                        chat_id, msg, dl_path, status_msg, upload_progress
+                                    )
+                                else:
+                                    await self._send_generic(
+                                        chat_id, msg, dl_path, status_msg, upload_progress,
+                                        force_document=True,
+                                    )
+                            else:
+                                await self._send_generic(
+                                    chat_id, msg, dl_path, status_msg, upload_progress,
+                                    force_document=True,
+                                )
+                    else:
+                        await self._send_generic(
+                            chat_id, msg, dl_path, status_msg, upload_progress
+                        )
 
             await status_msg.edit("<b>Media group uploaded.</b>", parse_mode="html")
+            return True
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Media group error: {e}")
-            await status_msg.edit(f"<b>Error processing media group:</b> {e}", parse_mode="html")
+            await status_msg.edit(
+                f"<b>Error processing media group:</b> {html.escape(str(e))}",
+                parse_mode="html",
+            )
+            return False
         finally:
             for _, path in downloaded:
                 cleanup_download(path)
 
     async def _download_and_send_media(self, chat_id, message, status_msg, entity):
+        if message.file and not is_within_upload_limit(message.file.size):
+            await status_msg.edit(
+                f"<b>File too large.</b> Size: <code>{format_bytes(message.file.size)}</code> "
+                f"exceeds the 2 GB upload limit.",
+                parse_mode="html",
+            )
+            return False
+
         dl_path = None
         try:
             progress = Progress(self.client, chat_id, status_msg.id, "Downloading")
             filename = get_file_name(message)
-            path = get_download_path(message.id, filename)
+            path = get_download_path(chat_id, message.id, filename)
             dl_path = await self._getter.download_media(
                 message, file=path, progress_callback=progress
             )
 
             if not dl_path:
                 await status_msg.edit("<b>Download failed.</b>", parse_mode="html")
-                return
+                return False
 
             await progress.finish()
 
             upload_progress = Progress(self.client, chat_id, status_msg.id, "Uploading")
 
+            if message.gif:
+                return await self._send_animation(
+                    chat_id, message, dl_path, status_msg, upload_progress
+                )
             if message.video:
-                await self._send_video(chat_id, message, dl_path, status_msg, upload_progress)
-            elif message.audio:
-                await self._send_audio(chat_id, message, dl_path, status_msg, upload_progress)
-            elif message.document:
+                return await self._send_video(
+                    chat_id, message, dl_path, status_msg, upload_progress
+                )
+            if message.audio:
+                return await self._send_audio(
+                    chat_id, message, dl_path, status_msg, upload_progress
+                )
+            if message.document:
                 mime = getattr(message.document, "mime_type", "") or ""
                 if mime.startswith("video/"):
-                    await self._send_video(chat_id, message, dl_path, status_msg, upload_progress)
-                elif mime.startswith("audio/"):
-                    await self._send_audio(chat_id, message, dl_path, status_msg, upload_progress)
-                else:
-                    sent = await self.client.send_file(
-                        chat_id, dl_path,
-                        caption=message.text,
-                        force_document=True,
-                        progress_callback=upload_progress,
+                    return await self._send_video(
+                        chat_id, message, dl_path, status_msg, upload_progress
                     )
-                    async with self.stats_lock:
-                        self.downloaded_count += 1
-                    if sent:
-                        await self.forwarder.forward_media(chat_id, sent.id)
-                    await status_msg.edit("<b>Uploaded.</b>", parse_mode="html")
-            else:
-                sent = await self.client.send_file(
-                    chat_id, dl_path,
-                    caption=message.text,
-                    progress_callback=upload_progress,
+                if mime.startswith("audio/"):
+                    return await self._send_audio(
+                        chat_id, message, dl_path, status_msg, upload_progress
+                    )
+                info = get_media_info(dl_path)
+                if info:
+                    dur = get_media_duration(info)
+                    w, h = get_media_dimensions(info, dl_path)
+                    if dur and w and h:
+                        return await self._send_video(
+                            chat_id, message, dl_path, status_msg, upload_progress
+                        )
+                    if dur:
+                        return await self._send_audio(
+                            chat_id, message, dl_path, status_msg, upload_progress
+                        )
+                return await self._send_generic(
+                    chat_id, message, dl_path, status_msg, upload_progress,
+                    force_document=True,
                 )
-                async with self.stats_lock:
-                    self.downloaded_count += 1
-                if sent:
-                    await self.forwarder.forward_media(chat_id, sent.id)
-                await status_msg.edit("<b>Uploaded.</b>", parse_mode="html")
+            return await self._send_generic(
+                chat_id, message, dl_path, status_msg, upload_progress
+            )
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Download/send error: {e}")
-            await status_msg.edit(f"<b>Error:</b> {e}", parse_mode="html")
+            await status_msg.edit(
+                f"<b>Error:</b> {html.escape(str(e))}", parse_mode="html"
+            )
+            return False
         finally:
             if dl_path:
                 cleanup_download(dl_path)
+
+    async def _send_generic(self, chat_id, message, dl_path, status_msg, progress,
+                            force_document=False):
+        caption, entities = prepare_caption(message)
+        sent = await self.client.send_file(
+            chat_id, dl_path,
+            caption=caption,
+            formatting_entities=entities,
+            force_document=force_document,
+            progress_callback=progress,
+        )
+        async with self.stats_lock:
+            self.downloaded_count += 1
+        if sent:
+            await self.forwarder.forward_media(chat_id, sent.id)
+        await status_msg.edit("<b>Uploaded.</b>", parse_mode="html")
+        return True
 
     def _extract_video_attrs(self, message):
         doc = message.video or message.document
@@ -793,48 +1231,90 @@ class TelegramBot:
         return None, None, None
 
     async def _send_video(self, chat_id, message, dl_path, status_msg, progress):
-        duration, width, height = self._extract_video_attrs(message)
+        info = get_media_info(dl_path)
+        duration = get_media_duration(info)
+        width, height = get_media_dimensions(info, dl_path)
 
-        if duration is None or width is None:
-            info = get_media_info(dl_path)
-            if duration is None:
-                duration = get_media_duration(info)
-            if width is None:
-                width, height = get_media_dimensions(info, dl_path)
+        if not duration or not width or not height:
+            attr_dur, attr_w, attr_h = self._extract_video_attrs(message)
+            if not duration:
+                duration = attr_dur
+            if not width:
+                width = attr_w
+            if not height:
+                height = attr_h
 
-        thumb = generate_video_thumbnail(dl_path, f"assets/thumb_{message.id}.jpg")
+        if not duration:
+            duration = 0
+        if not width:
+            width = 640
+        if not height:
+            height = 480
 
-        kwargs = dict(
-            caption=message.text,
-            supports_streaming=True,
-            thumb=thumb,
-            progress_callback=progress,
-        )
-        if duration:
-            kwargs["duration"] = duration
-        if width and height:
-            kwargs["width"] = width
-            kwargs["height"] = height
+        thumb_path = get_thumb_path(chat_id, message.id)
+        thumb = generate_video_thumbnail(dl_path, thumb_path)
 
-        sent = await self.client.send_file(chat_id, dl_path, **kwargs)
-        if thumb and os.path.exists(thumb):
-            try:
-                os.remove(thumb)
-            except OSError:
-                pass
+        try:
+            caption, entities = prepare_caption(message)
+            attributes = [DocumentAttributeVideo(
+                duration=duration,
+                w=width,
+                h=height,
+                supports_streaming=True,
+            )]
+            kwargs = dict(
+                caption=caption,
+                formatting_entities=entities,
+                attributes=attributes,
+                thumb=thumb,
+                force_document=False,
+                progress_callback=progress,
+            )
+
+            sent = await self.client.send_file(chat_id, dl_path, **kwargs)
+        finally:
+            if thumb and os.path.exists(thumb):
+                try:
+                    os.remove(thumb)
+                except OSError:
+                    pass
+
         async with self.stats_lock:
             self.downloaded_count += 1
         if sent:
             await self.forwarder.forward_media(chat_id, sent.id)
         await status_msg.edit("<b>Uploaded.</b>", parse_mode="html")
+        return True
+
+    async def _send_animation(self, chat_id, message, dl_path, status_msg, progress):
+        attributes = list(message.document.attributes) if message.document else None
+        caption, entities = prepare_caption(message)
+
+        sent = await self.client.send_file(
+            chat_id,
+            dl_path,
+            caption=caption,
+            formatting_entities=entities,
+            attributes=attributes,
+            mime_type=getattr(message.document, "mime_type", "video/mp4"),
+            progress_callback=progress,
+        )
+        async with self.stats_lock:
+            self.downloaded_count += 1
+        if sent:
+            await self.forwarder.forward_media(chat_id, sent.id)
+        await status_msg.edit("<b>Uploaded.</b>", parse_mode="html")
+        return True
 
     async def _send_audio(self, chat_id, message, dl_path, status_msg, progress):
         info = get_media_info(dl_path)
         duration = get_media_duration(info)
         artist, title = get_audio_tags(info)
+        caption, entities = prepare_caption(message)
 
         kwargs = dict(
-            caption=message.text,
+            caption=caption,
+            formatting_entities=entities,
             progress_callback=progress,
         )
         if duration:
@@ -850,6 +1330,7 @@ class TelegramBot:
         if sent:
             await self.forwarder.forward_media(chat_id, sent.id)
         await status_msg.edit("<b>Uploaded.</b>", parse_mode="html")
+        return True
 
     # ------------------------------------------------------------------
     # Batch Download
@@ -875,8 +1356,14 @@ class TelegramBot:
             await self.client.send_message(chat_id, "Batch range too large (max 500 posts).")
             return
 
-        task = asyncio.create_task(self._batch_download_task(chat_id, e1, m1, m2))
         async with self.task_lock:
+            if self.cleanup_in_progress:
+                await self.client.send_message(
+                    chat_id, "<b>Cleanup in progress, please retry shortly.</b>",
+                    parse_mode="html",
+                )
+                return
+            task = asyncio.create_task(self._batch_download_task(chat_id, e1, m1, m2))
             self.running_tasks.add(task)
 
     async def _batch_download_task(self, chat_id, entity, start_id, end_id):
@@ -927,13 +1414,26 @@ class TelegramBot:
                         )
 
                         if group_key and len(group) > 1:
-                            await self._process_media_group(chat_id, group, progress_msg)
-                            downloaded += 1
+                            ok = await self._process_media_group(chat_id, group, progress_msg)
+                            if ok:
+                                downloaded += 1
+                            else:
+                                failed += 1
                         elif message.media:
-                            await self._download_and_send_media(chat_id, message, progress_msg, entity)
-                            downloaded += 1
+                            ok = await self._download_and_send_media(
+                                chat_id, message, progress_msg, entity
+                            )
+                            if ok:
+                                downloaded += 1
+                            else:
+                                failed += 1
                         elif message.text:
-                            await self.client.send_message(chat_id, message.text)
+                            await self.client.send_message(
+                                chat_id,
+                                message.message or "",
+                                formatting_entities=list(message.entities)
+                                    if message.entities else None,
+                            )
                             async with self.stats_lock:
                                 self.downloaded_count += 1
                             downloaded += 1

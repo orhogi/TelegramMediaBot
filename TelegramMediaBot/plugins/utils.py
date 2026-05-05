@@ -1,3 +1,4 @@
+import copy
 import os
 import re
 import shutil
@@ -6,6 +7,7 @@ from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 
 DOWNLOAD_DIR = "downloads"
 ASSETS_DIR = "assets"
+CAPTION_LIMIT = 1024
 
 
 def format_bytes(size):
@@ -28,12 +30,17 @@ def format_time(seconds):
     return f"{s}s"
 
 
-def get_download_path(message_id, filename=None):
-    path = os.path.join(DOWNLOAD_DIR, str(message_id))
+def get_download_path(chat_id, message_id, filename=None):
+    path = os.path.join(DOWNLOAD_DIR, str(chat_id), str(message_id))
     os.makedirs(path, exist_ok=True)
     if filename:
         return os.path.join(path, filename)
     return path
+
+
+def get_thumb_path(chat_id, message_id):
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    return os.path.join(ASSETS_DIR, f"thumb_{chat_id}_{message_id}.jpg")
 
 
 def cleanup_download(path):
@@ -41,10 +48,48 @@ def cleanup_download(path):
         if os.path.isfile(path):
             os.remove(path)
         parent = os.path.dirname(path)
-        if parent not in (DOWNLOAD_DIR, ASSETS_DIR) and os.path.isdir(parent) and not os.listdir(parent):
-            os.rmdir(parent)
+        while parent and os.path.basename(parent) and parent not in (DOWNLOAD_DIR, ASSETS_DIR):
+            if os.path.isdir(parent) and not os.listdir(parent):
+                os.rmdir(parent)
+                parent = os.path.dirname(parent)
+            else:
+                break
     except OSError:
         pass
+
+
+def prepare_caption(message):
+    text = getattr(message, "message", None) or ""
+    entities = list(message.entities) if getattr(message, "entities", None) else None
+
+    if not text:
+        return None, None
+
+    if len(text) <= CAPTION_LIMIT:
+        return text, entities
+
+    truncated = text[: CAPTION_LIMIT - 1] + "…"
+    if not entities:
+        return truncated, None
+
+    new_entities = []
+    cap = len(truncated)
+    for entity in entities:
+        if entity.offset >= cap:
+            continue
+        if entity.offset + entity.length > cap:
+            new_entity = copy.copy(entity)
+            new_entity.length = cap - entity.offset
+            new_entities.append(new_entity)
+        else:
+            new_entities.append(entity)
+    return truncated, new_entities or None
+
+
+def is_within_upload_limit(size_bytes, is_premium=False):
+    if not size_bytes:
+        return True
+    return size_bytes <= file_size_limit(is_premium)
 
 
 def clean_all_downloads():
@@ -115,6 +160,21 @@ def size_of_downloads():
                     except OSError:
                         pass
     return count, total
+
+
+def parse_story_url(url):
+    url = url.strip()
+    if url.startswith("t.me/"):
+        url = "https://" + url
+    elif url.startswith("www.t.me/"):
+        url = "https://" + url
+
+    match = re.match(
+        r"https?://(?:www\.)?t\.me/([A-Za-z0-9_]{5,32})/s/(\d+)/?$", url
+    )
+    if match:
+        return match.group(1), int(match.group(2))
+    return None, None
 
 
 def parse_tg_url(url):
@@ -211,13 +271,13 @@ def get_media_duration(info):
         return None
     fmt = info.get("format", {})
     duration = fmt.get("duration")
-    if duration:
-        return int(float(duration))
+    if duration and float(duration) > 0:
+        return max(1, int(round(float(duration))))
     streams = info.get("streams", [])
     for stream in streams:
         dur = stream.get("duration")
-        if dur:
-            return int(float(dur))
+        if dur and float(dur) > 0:
+            return max(1, int(round(float(dur))))
     return None
 
 
